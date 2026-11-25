@@ -1,48 +1,46 @@
-**中文** | [English](README.en.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
-
 # oracle-snatch
 
-一个小的 Python 循环脚本：不停用甲骨文云的官方接口申请免费 ARM 实例（VM.Standard.A1.Flex），直到哪次赶上放货、接口点头为止。
+A small Python loop that keeps asking Oracle Cloud's official API for a free ARM instance (VM.Standard.A1.Flex) until one attempt happens to land when capacity opens up and the API says yes.
 
-## 为什么写这个
+## Background
 
-Always Free 的 A1.Flex 免费额度（总共 4 核 / 24 GB）是目前最划算的免费服务器，没有之一。问题是热门区域在控制台里基本永远显示「Out of host capacity」（没货）。这个货不是永久没了，而是会不定期放出来一小波，没人通知。对着控制台刷一周刷新纯属浪费生命，不如让脚本替你去问。
+The Always Free A1.Flex allowance (4 cores / 24 GB in total) is the best free server deal out there, period. The problem: in popular regions the console basically always says "Out of host capacity". That capacity is not gone forever — it gets released in small, irregular waves, and nobody notifies you. Refreshing the console for a week is a waste of a life. Let a script do the asking.
 
-2026 年 10 月我用一个粗糙版本在东京区域跑了好几天。日志翻来覆去就是「没货」，中间还因为我把间隔设得太密、吃过几次 429 限流。最后抢到了那台 4 核 24 GB 的机器，我现在自托管的大部分服务都跑在它上面，到今天账单还是 0。这个仓库就是那个循环的整理版，配置都抽了出来。
+The upstream author reported successfully provisioning a 4-OCPU, 24-GB instance in Tokyo after several days of retries in October 2026. This repository is a research continuation of [the original MIT-licensed project](https://github.com/lucasforster1108-boop/oracle-snatch).
 
-## 它做什么
+## What it does
 
-- 只用甲骨文官方 API（Python 的 `oci` SDK），不搞控制台自动化、不模拟浏览器。
-- 轮询你所在区域的每一个可用域（AD），每轮每个 AD 尝试一次。东京只有一个 AD，多 AD 的区域中签率会好一些。
-- 「没货」就当「还没到时候」：歇一会儿，下一个 AD，下一轮。
-- 遇到 429 限流就长退避（默认 300 秒）。硬顶着 429 往前冲，只会让限流赖着不走。
-- 遇到配额错误（LimitExceeded）直接停，并把原因写清楚：这说明你的免费额度已经用完了，再重试一万次也没用。
-- 抢到后等实例变成 RUNNING，拿到公网 IP，写进 `snatched.json`，可选发一条 Telegram 通知，然后退出。
-- `--dry-run` 只验证配置：列出可用域、确认会用哪个镜像，不真开机器。第一次先跑这个。
+- Uses only Oracle's official API (the `oci` Python SDK). No console automation, no browser simulation.
+- Polls every Availability Domain (AD) in your region, one attempt per AD per round. Tokyo has a single AD; regions with more ADs give you better odds.
+- Treats "out of capacity" as "not yet": waits a bit, moves to the next AD, starts the next round.
+- Backs off long (300 seconds by default) on a 429. Ramming through a rate limit only makes it stick around longer.
+- Stops on quota errors (LimitExceeded) and tells you why: a service limit or quota has been reached; review your tenancy before retrying.
+- Once it wins, waits for the instance to reach RUNNING, grabs the public IP, writes it to `snatched.json`, optionally sends a Telegram notification, and exits.
+- `--dry-run` only validates your setup: lists the ADs and confirms which image it would use, without launching anything. Run this first.
 
-它不做的事：不帮你注册账号、不建 VCN、不生成 API 密钥，更变不出不存在的货。它只是替你不知疲倦地问。
+What it does not do: it will not register an account for you, build a VCN, generate API keys, or conjure capacity that does not exist. It just asks, tirelessly, on your behalf.
 
-## 安装与使用
+## Install and use
 
-需要一个甲骨文云账号，以及 OCI 的配置文件（`~/.oci/config`，里面配好 API 密钥）。用过 OCI CLI 或 SDK 的人都有这个文件。
+You need an Oracle Cloud account and an OCI config file (`~/.oci/config`, with an API key set up). Anyone who has used the OCI CLI or SDK already has this file.
 
-还需要一个子网 OCID：控制台里 Networking -> Virtual Cloud Networks -> 你的 VCN -> Subnets。想要公网 IP 就选公有子网（你肯定想要）。
+You also need a subnet OCID: in the console, Networking -> Virtual Cloud Networks -> your VCN -> Subnets. Pick a public subnet if you want a public IP (you do).
 
 ```bash
-git clone https://github.com/lucasforster1108-boop/oracle-snatch.git
+git clone https://github.com/hoangsvit/oracle-snatch.git
 cd oracle-snatch
 pip install -r requirements.txt
 
 cp config.example.env config.env
-# 改 config.env：必填的只有 SUBNET_ID 和 SSH_PUBLIC_KEY_FILE
+# Edit config.env: the only required fields are SUBNET_ID and SSH_PUBLIC_KEY_FILE
 
 python3 snatch.py --dry-run
 python3 snatch.py
 ```
 
-## 长期挂着跑
+## Running it long-term
 
-这东西就是设计成无人值守跑好几天的，所以挂在任何一台你已有的常开机器上就行（别处的免费小鸡、家里的服务器、树莓派都可以）。仓库里附了一个 systemd 服务示例：
+This is meant to run unattended for days, so put it on any always-on machine you already have (a free VPS somewhere else, a home server, a Raspberry Pi). A sample systemd service is included:
 
 ```bash
 sudo cp oracle-snatch.service /etc/systemd/system/
@@ -50,20 +48,26 @@ sudo systemctl enable --now oracle-snatch
 tail -f snatch.log
 ```
 
-## 踩过的坑
+## Lessons learned the hard way
 
-- 免费 A1 额度是总量，不是每台一份：一共 4 核 + 24 GB。可以开一台 4/24，也可以拆成两台 2/12。超了就是 LimitExceeded，脚本会主动停，别怪它。
-- 账号升级成 PAYG（按量付费）不会吃掉免费额度，额度内的 A1 用量照样不收钱，体感上货还稍微多一点。我的账号就是 PAYG，账单至今 0 元，另外设了个预算警报兜底。
-- 启动盘也算在 200 GB 免费块存储总量里。50 GB 对小服务器足够了，别因为「反正免费」默认拉满 200，剩下的额度留给第二台更划算。
-- 放货时间没规律，经常在半夜。循环的意义就在这：凌晨 4 点它醒着，你不用。
-- 别把重试间隔改成几秒。你不会更快抢到，只会吃 429，然后接下来一阵子什么都抢不到。
+- The free A1 allowance is a total pool, not per-instance: 4 cores + 24 GB altogether. One 4/24 machine, or split it into two 2/12 machines. Go over and you get LimitExceeded — the script stops on purpose, do not blame it.
+- PAYG accounts can incur charges. Verify your current allowances and existing resources in OCI before launching; budget alerts do not cap spending.
+- Boot volumes count toward the 200 GB free block storage total. 50 GB is plenty for a small server; do not max out 200 just because it is free — the leftover allowance is more useful for a second machine.
+- Capacity drops are irregular, often in the middle of the night. That is the whole point of the loop: at 4 a.m. it is awake, you do not have to be.
+- Do not shorten the retry interval to a few seconds. You will not snatch anything faster; you will just eat 429s and then get nothing for a while.
 
-## 文件
+## Files
 
-- `snatch.py`：全部逻辑，一个文件
-- `config.example.env`：所有配置项，带注释
-- `oracle-snatch.service`：systemd 服务示例
+- `snatch.py`: all the logic, one file
+- `config.example.env`: every config option, commented
+- `oracle-snatch.service`: sample systemd service
 
-## 授权
+## Safety and testing
+
+The local provisioning record prevents repeat launches from the same working directory. If `snatched.json` already exists, reconcile the instance in the OCI Console before removing it. Local limits do not guarantee zero charges. See [RESEARCH.md](RESEARCH.md) for limitations and recovery instructions.
+
+Run offline tests with `python -m unittest discover -s tests -v`. No live OCI credentials are needed.
+
+## License
 
 MIT
