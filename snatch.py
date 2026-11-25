@@ -21,6 +21,8 @@ The OCI API credentials come from your standard ~/.oci/config file.
 """
 
 import argparse
+import math
+import uuid
 import json
 import os
 import sys
@@ -78,7 +80,7 @@ def notify_telegram(token, chat_id, text):
         )
         urllib.request.urlopen(req, timeout=15)
     except Exception as exc:  # notification is best-effort, never crash the loop
-        log(f"Telegram notify failed: {exc}")
+        log(f"Telegram notify failed: {type(exc).__name__}")
 
 
 def resolve_image(compute, compartment_id, image_id):
@@ -138,6 +140,56 @@ def wait_for_public_ip(compute, network, compartment_id, instance_id, timeout=60
     return None
 
 
+def validate_settings(cfg):
+    """Local conservative limits; not a guarantee of zero OCI charges."""
+    for key, maximum in (("ocpus", 4), ("memory_gb", 24), ("boot_volume_gb", 200)):
+        value = cfg[key]
+        if not math.isfinite(value) or not 0 < value <= maximum:
+            raise ValueError(f"{key} must be positive and at most {maximum}")
+    if cfg["boot_volume_gb"] < 50:
+        raise ValueError("boot volume must be at least 50 GB")
+    if cfg["interval"] < 120 or cfg["rate_limit_sleep"] < 300:
+        raise ValueError("Retry intervals must be at least 120/300 seconds")
+
+
+def launch_and_record(compute, details, cfg, ad, result_file):
+    """Persist a launch intent before calling OCI; fail closed on ambiguity."""
+    token = str(uuid.uuid4())
+    # Exclusive creation also prevents concurrent launches on this host.
+    with open(result_file, "x", encoding="utf-8") as f:
+        json.dump({"status": "pending", "retry_token": token,
+                   "availability_domain": ad}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        instance = compute.launch_instance(
+            details, opc_retry_token=token,
+            retry_strategy=oci.retry.NoneRetryStrategy()).data
+    except ServiceError as exc:
+        # Only clear intent for an explicit rejection, not ambiguous 5xx.
+        if exc.status == 429 or (400 <= exc.status < 500 and exc.status != 408):
+            os.unlink(result_file)
+        elif "out of host capacity" in (exc.message or "").lower():
+            os.unlink(result_file)
+        raise
+    result = {"status": "created", "instance_id": instance.id,
+              "display_name": instance.display_name, "availability_domain": ad,
+              "shape": SHAPE, "ocpus": cfg["ocpus"],
+              "memory_gb": cfg["memory_gb"], "public_ip": None,
+              "created_at": datetime.now().isoformat(timespec="seconds")}
+    write_result(result_file, result)
+    return instance, result
+
+
+def write_result(path, result):
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Snatch a free OCI A1.Flex instance")
     parser.add_argument("--config", default=os.environ.get(
@@ -165,6 +217,12 @@ def main():
         "tg_token": get_setting(file_cfg, "TG_BOT_TOKEN"),
         "tg_chat_id": get_setting(file_cfg, "TG_CHAT_ID"),
     }
+    try:
+        validate_settings(cfg)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if not args.dry_run and os.path.exists(RESULT_FILE):
+        sys.exit("Existing launch record: reconcile OCI instances before removing snatched.json.")
     key_path = os.path.expanduser(get_setting(
         file_cfg, "SSH_PUBLIC_KEY_FILE", "~/.ssh/id_ed25519.pub"))
     if not os.path.exists(key_path):
@@ -197,29 +255,25 @@ def main():
             attempt += 1
             details = build_launch_details(cfg, ad, image.id, ssh_key_text)
             try:
-                resp = compute.launch_instance(details)
-                instance = resp.data
-                log(f"SUCCESS in {ad}: instance {instance.id} "
-                    f"({instance.lifecycle_state})")
-                ip = wait_for_public_ip(
-                    compute, network, cfg["compartment_id"], instance.id)
-                result = {
-                    "instance_id": instance.id,
-                    "display_name": instance.display_name,
-                    "availability_domain": ad,
-                    "shape": SHAPE,
-                    "ocpus": cfg["ocpus"],
-                    "memory_gb": cfg["memory_gb"],
-                    "public_ip": ip,
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                    json.dump(result, f, indent=2)
+                instance, result = launch_and_record(compute, details, cfg, ad, RESULT_FILE)
+                log(f"SUCCESS in {ad}: instance {instance.id}")
+                try:
+                    ip = wait_for_public_ip(
+                        compute, network, cfg["compartment_id"], instance.id)
+                    result["public_ip"] = ip
+                    write_result(RESULT_FILE, result)
+                except Exception as exc:
+                    log(f"Instance created; IP lookup failed ({type(exc).__name__}). "
+                        "Inspect snatched.json and OCI Console. No further launches.")
+                    return 1
                 log(f"Public IP: {ip}. Details saved to {RESULT_FILE}")
                 notify_telegram(cfg["tg_token"], cfg["tg_chat_id"],
                                 f"oracle-snatch: got one in {ad}, IP {ip}")
                 return 0
             except ServiceError as exc:
+                if os.path.exists(RESULT_FILE):
+                    log("Uncertain launch outcome; inspect OCI Console and snatched.json. Stopping.")
+                    return 1
                 message = (exc.message or "")
                 if exc.status == 429:
                     log(f"[{ad}] rate limited (429), sleeping "
@@ -241,8 +295,8 @@ def main():
                         "~/.oci/config. Stopping.")
                     return 1
                 else:
-                    log(f"[{ad}] {exc.status} {exc.code}: {message} "
-                        f"(attempt {attempt}), moving on")
+                    log(f"[{ad}] {exc.status} {exc.code}: {message}. Stopping.")
+                    return 1
             time.sleep(5)
         log(f"Full round done, no capacity anywhere. Sleeping {cfg['interval']}s")
         time.sleep(cfg["interval"])
